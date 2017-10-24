@@ -119,6 +119,7 @@ type KResult = Either KError KResponse
 type TransactionCounter = IORef Int
 type CallId             = (TransactionId, SockAddr)
 type CallRes            = MVar KResult
+-- PendingCalls 是个IORef，里面放着一个Map，存放CallID和返回值
 type PendingCalls       = IORef (Map CallId CallRes)
 
 type HandlerBody h = SockAddr -> BValue -> h (BE.Result BValue)
@@ -178,6 +179,7 @@ newManager opts @ Options {..} servAddr handlers = do
     calls <- newIORef M.empty
     return $ Manager sock opts tref tran calls handlers
   where
+    --  创建udp socket
     bindServ = do
       let family = sockAddrFamily servAddr
       sock <- socket family Datagram defaultProtocol
@@ -234,6 +236,7 @@ instance Exception QueryFailure
 
 sendMessage :: MonadIO m => BEncode a => Socket -> SockAddr -> a -> m ()
 sendMessage sock addr a = do
+  -- UDP发送一定量的数据
   liftIO $ sendManyTo sock (BL.toChunks (BE.encode a)) addr
 
 genTransactionId :: TransactionCounter -> IO TransactionId
@@ -250,8 +253,11 @@ getQueryCount = do
 
 registerQuery :: CallId -> PendingCalls -> IO CallRes
 registerQuery cid ref = do
+  -- 创建一个空的MVar
   ares <- newEmptyMVar
+  -- 修改IORef的数据
   atomicModifyIORef' ref $ \ m -> (M.insert cid ares m, ())
+  -- 反回这个Mvar给调用者
   return ares
 
 -- simultaneous M.lookup and M.delete guarantees that we never get two
@@ -265,7 +271,9 @@ queryResponse :: BEncode a => CallRes -> IO a
 queryResponse ares = do
   res <- readMVar ares
   case res of
+    -- 出错，直接丢出 QueryFailed 异常
     Left  (KError   c m _) -> throwIO $ QueryFailed c (T.decodeUtf8 m)
+    -- 得到结果，进行解析
     Right (KResponse {..}) ->
       case fromBEncode respVals of
         Right r -> pure r
@@ -274,6 +282,7 @@ queryResponse ares = do
 -- (sendmsg EINVAL)
 sendQuery :: BEncode a => Socket -> SockAddr -> a -> IO ()
 sendQuery sock addr q = handle sockError $ sendMessage sock addr q
+  -- 发送消息并捕获异常
   where
     sockError :: IOError -> IO ()
     sockError _ = throwIO SendFailed
@@ -285,19 +294,25 @@ sendQuery sock addr q = handle sockError $ sendMessage sock addr q
 --
 query :: forall h m a b. (MonadKRPC h m, KRPC a b) => SockAddr -> a -> m b
 query addr params = do
+  -- 得到Manager
   Manager {..} <- getManager
+  -- 生成查询事务ID
   tid <- liftIO $ genTransactionId transactionCounter
+  -- 获取查询方法
   let queryMethod = method :: Method a b
+  -- 生成查询签名
   let signature = querySignature (methodName queryMethod) tid addr
   $(logDebugS) "query.sending" signature
 
   mres <- liftIO $ do
+    -- 注册查询
     ares <- registerQuery (tid, addr) pendingCalls
-
+    -- 生成查询的二进制包
     let q = KQuery (toBEncode params) (methodName queryMethod) tid
+    -- 发送查询，并在异常的时候注销相关操作
     sendQuery sock addr q
       `onException` unregisterQuery (tid, addr) pendingCalls
-
+    -- 增加超时处理
     timeout (optQueryTimeout options * 10 ^ (6 :: Int)) $ do
       queryResponse ares
 
